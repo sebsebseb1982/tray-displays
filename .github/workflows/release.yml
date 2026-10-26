@@ -1,0 +1,89 @@
+name: Release
+
+# Every push to the main branch is analysed with Conventional Commits:
+#   fix: / perf: / revert:  -> patch
+#   feat:                   -> minor
+#   BREAKING CHANGE / "!"   -> minor (see .releaserc.json)
+#   docs:, chore:, ci:...   -> no release
+# When a release is due, the Windows binary is built and attached to the GitHub
+# release created for the new vX.Y.Z tag.
+
+on:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Compute next version
+    runs-on: ubuntu-latest
+    outputs:
+      published: ${{ steps.semrel.outputs.new_release_published }}
+      version: ${{ steps.semrel.outputs.new_release_version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: semrel
+        uses: cycjimmy/semantic-release-action@v4
+        with:
+          dry_run: true
+          extra_plugins: |
+            conventional-changelog-conventionalcommits@8.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build:
+    name: Build windows-x64
+    needs: version
+    if: needs.version.outputs.published == 'true'
+    runs-on: windows-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        shell: powershell
+        run: ./build.ps1 -Version $env:VERSION
+      - name: Package
+        shell: powershell
+        run: |
+          $pkg = "TrayDisplays-v$env:VERSION-windows-x64"
+          New-Item -ItemType Directory -Force -Path "dist/$pkg" | Out-Null
+          Copy-Item bin/TrayDisplays.exe "dist/$pkg/"
+          Compress-Archive -Path "dist/$pkg/*" -DestinationPath "dist/$pkg.zip"
+          Remove-Item -Recurse -Force "dist/$pkg"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: dist/*.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum *.zip > SHA256SUMS
+      - uses: cycjimmy/semantic-release-action@v4
+        with:
+          extra_plugins: |
+            conventional-changelog-conventionalcommits@8.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
