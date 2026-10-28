@@ -17,6 +17,7 @@ namespace TrayDisplays
         public bool IsPrimary;
         public bool Enabled;
         public int[] BaselinePaths = new int[0];   // indices des paths du snapshot « tout actif »
+        public string DetachedTarget;      // sortie d'un écran branché mais éteint, absent du snapshot
 
         public string SizeText
         {
@@ -139,9 +140,25 @@ namespace TrayDisplays
 
             Dictionary<Point, List<int>> baselineGroups = BuildPathGroups(this._baseline);
             HashSet<Point> livePositions = new HashSet<Point>();
+            bool baselineStale = this._baseline == null;
             foreach (MonitorEntry m in monitors)
             {
                 livePositions.Add(m.Bounds.Location);
+                // Un moniteur actif sans chemin au même endroit dans le snapshot : la disposition
+                // a changé hors de l'application (écran principal, hot-plug...), le snapshot est périmé.
+                if (!baselineGroups.ContainsKey(m.Bounds.Location))
+                {
+                    baselineStale = true;
+                }
+            }
+
+            // Rien n'est coupé (ou le snapshot est périmé) : le snapshot courant devient la nouvelle
+            // référence, avant de chercher les écrans coupés, sinon d'anciennes positions
+            // apparaîtraient comme des écrans « coupés » fantômes.
+            if (monitors.Count > 0 && (baselineStale || baselineGroups.Count == monitors.Count))
+            {
+                this._baseline = active.Clone();
+                baselineGroups = BuildPathGroups(this._baseline);
             }
 
             List<Screen> screens = new List<Screen>();
@@ -235,20 +252,30 @@ namespace TrayDisplays
                 screens.Add(s);
             }
 
-            // Si rien n'est coupé, le snapshot courant devient la nouvelle référence
-            // (il intègre les changements faits hors de l'application : résolution, hot-plug).
-            if (this._baseline == null || (baselineGroups.Count == monitors.Count && monitors.Count > 0))
+            // Écrans branchés mais éteints et absents du snapshot (coupés avant le lancement de
+            // l'application) : sorties disponibles sans chemin actif. Leur taille est inconnue tant
+            // qu'ils sont éteints ; ils sont dessinés à droite de la disposition.
+            DisplayConfigData all = DisplayConfigData.Query(Native.QdcAllPaths | Native.QdcVirtualModeAware);
+            HashSet<string> known = TargetKeys(active);
+            known.UnionWith(TargetKeys(this._baseline));
+            Rectangle layout = Rectangle.Empty;
+            foreach (Screen s in screens)
             {
-                this._baseline = active.Clone();
-                baselineGroups = BuildPathGroups(this._baseline);
-                foreach (Screen s in screens)
-                {
-                    List<int> bl;
-                    if (baselineGroups.TryGetValue(s.Bounds.Location, out bl))
-                    {
-                        s.BaselinePaths = bl.ToArray();
-                    }
-                }
+                layout = layout.IsEmpty ? s.Bounds : Rectangle.Union(layout, s.Bounds);
+            }
+            int nextLeft = layout.Right;
+            foreach (KeyValuePair<string, int> kv in FindDetachedPaths(all, known, SourceKeys(active)))
+            {
+                Screen s = new Screen();
+                s.Name = all.TargetFriendlyName(kv.Value);
+                s.DetachedTarget = kv.Key;
+                s.Enabled = false;
+                s.IsPrimary = false;
+                s.Width = 1920;
+                s.Height = 1080;
+                s.Bounds = new Rectangle(nextLeft, layout.Top, s.Width, s.Height);
+                nextLeft += s.Width;
+                screens.Add(s);
             }
 
             HashSet<int> mapped = new HashSet<int>();
@@ -269,6 +296,10 @@ namespace TrayDisplays
         // des chemins du snapshot (les modes sont conservés tels quels).
         public string Toggle(Screen target)
         {
+            if (!target.Enabled && target.DetachedTarget != null)
+            {
+                return EnableDetached(target, true);
+            }
             HashSet<int> activePaths;
             string error = ComputeToggle(target, out activePaths);
             if (error != null)
@@ -281,6 +312,10 @@ namespace TrayDisplays
         // Même calcul que Toggle, mais validation seule (SDC_VALIDATE) : rien n'est appliqué.
         public string ValidateToggle(Screen target)
         {
+            if (!target.Enabled && target.DetachedTarget != null)
+            {
+                return EnableDetached(target, false);
+            }
             HashSet<int> activePaths;
             string error = ComputeToggle(target, out activePaths);
             if (error != null)
@@ -322,20 +357,49 @@ namespace TrayDisplays
             return null;
         }
 
-        // Réactive tous les écrans. Si on connaît la configuration d'origine (écrans coupés depuis
-        // cette session), on rallume exactement ses chemins : c'est déterministe. Sinon (application
-        // relancée), repli sur SDC_TOPOLOGY_EXTEND, où Windows choisit seul ce qu'il rallume.
+        // Réactive tous les écrans. Les écrans coupés depuis cette session retrouvent exactement
+        // leurs chemins du snapshot (déterministe), puis les écrans éteints inconnus du snapshot
+        // reçoivent un chemin un par un. En cas d'échec, ou si rien n'est coupé, repli sur
+        // SDC_TOPOLOGY_EXTEND, où Windows choisit seul ce qu'il rallume.
         public string RestoreAll()
         {
-            if (this._baseline != null && this.HasDisabled)
+            if (!this.HasDisabled)
             {
-                string error = ApplyPathFlags(new HashSet<int>(this._mappedPaths), true);
-                if (error == null)
+                return RestoreByTopology();
+            }
+
+            bool cutFromBaseline = false;
+            foreach (Screen s in _screens)
+            {
+                if (!s.Enabled && s.BaselinePaths.Length > 0) cutFromBaseline = true;
+            }
+            if (cutFromBaseline && ApplyPathFlags(new HashSet<int>(this._mappedPaths), true) != null)
+            {
+                return RestoreByTopology();
+            }
+
+            // Chaque activation relance Refresh() : on reprend la liste à jour à chaque tour.
+            for (int attempt = 0; attempt < 8; attempt++)
+            {
+                Screen detached = null;
+                foreach (Screen s in _screens)
+                {
+                    if (!s.Enabled && s.DetachedTarget != null) { detached = s; break; }
+                }
+                if (detached == null)
                 {
                     return null;
                 }
+                if (EnableDetached(detached, true) != null)
+                {
+                    return RestoreByTopology();
+                }
             }
+            return null;
+        }
 
+        private string RestoreByTopology()
+        {
             uint validate = Native.SetDisplayConfig(0, IntPtr.Zero, 0, IntPtr.Zero,
                 Native.SdcTopologyExtend | Native.SdcValidate, IntPtr.Zero);
             if (validate != Native.ErrorSuccess)
@@ -405,8 +469,222 @@ namespace TrayDisplays
                 return "Application refusée : " + DisplayConfigData.DescribeError(hr);
             }
 
+            // Le snapshot est indexé par position : il suit le même décalage que les écrans actifs.
+            if (this._baseline != null)
+            {
+                this._baseline.ShiftSources(target.Bounds.Location);
+            }
             this.Refresh();
             return null;
+        }
+
+        // Position la plus proche de `proposed` où `target` touche un autre écran actif par un bord,
+        // sans chevaucher personne ; les bords alignés à `tolerance` près s'aimantent.
+        // Renvoie la position actuelle si aucune place n'est possible.
+        public Point SnapPosition(Screen target, Point proposed, int tolerance)
+        {
+            List<Rectangle> others = new List<Rectangle>();
+            foreach (Screen s in _screens)
+            {
+                if (s.Enabled && s.Bounds.Location != target.Bounds.Location) others.Add(s.Bounds);
+            }
+
+            Size size = target.Bounds.Size;
+            Point best = target.Bounds.Location;
+            long bestDistance = long.MaxValue;
+            List<Point> candidates = new List<Point>();
+            foreach (Rectangle o in others)
+            {
+                // À gauche / à droite de `o` : y libre tant que les bords se recouvrent.
+                int y = Align(Clamp(proposed.Y, o.Top - size.Height + 1, o.Bottom - 1),
+                    size.Height, o.Top, o.Bottom, tolerance);
+                candidates.Add(new Point(o.Left - size.Width, y));
+                candidates.Add(new Point(o.Right, y));
+                // Au-dessus / en dessous : x libre.
+                int x = Align(Clamp(proposed.X, o.Left - size.Width + 1, o.Right - 1),
+                    size.Width, o.Left, o.Right, tolerance);
+                candidates.Add(new Point(x, o.Top - size.Height));
+                candidates.Add(new Point(x, o.Bottom));
+            }
+
+            foreach (Point p in candidates)
+            {
+                Rectangle r = new Rectangle(p, size);
+                bool overlaps = false;
+                foreach (Rectangle o in others)
+                {
+                    if (r.IntersectsWith(o)) { overlaps = true; break; }
+                }
+                if (overlaps) continue;
+                long dx = p.X - proposed.X;
+                long dy = p.Y - proposed.Y;
+                if (dx * dx + dy * dy < bestDistance)
+                {
+                    bestDistance = dx * dx + dy * dy;
+                    best = p;
+                }
+            }
+            return best;
+        }
+
+        private static int Clamp(int value, int min, int max)
+        {
+            return Math.Max(min, Math.Min(max, value));
+        }
+
+        // Aligne le début (start) ou la fin (end) du segment de longueur `length` qui commence en `value`.
+        private static int Align(int value, int length, int start, int end, int tolerance)
+        {
+            if (Math.Abs(value - start) <= tolerance) return start;
+            if (Math.Abs(value + length - end) <= tolerance) return end - length;
+            return value;
+        }
+
+        // Déplace `target` en `location` (coordonnées du bureau). L'écran principal reste en (0,0) :
+        // si c'est lui qu'on déplace, ce sont les autres qui bougent d'autant en sens inverse.
+        public string MoveScreen(Screen target, Point location)
+        {
+            return ApplyMove(target, location, true);
+        }
+
+        // Validation seule du déplacement (SDC_VALIDATE) : rien n'est appliqué.
+        public string ValidateMove(Screen target, Point location)
+        {
+            return ApplyMove(target, location, false);
+        }
+
+        private string ApplyMove(Screen target, Point location, bool apply)
+        {
+            if (!target.Enabled)
+            {
+                return "Réactivez d'abord cet écran avant de le déplacer.";
+            }
+            Point from = target.Bounds.Location;
+            if (location == from)
+            {
+                return null;
+            }
+
+            DisplayConfigData cfg = DisplayConfigData.Query(Native.QdcOnlyActivePaths | Native.QdcVirtualModeAware);
+            if (!MoveSource(cfg, from, location))
+            {
+                return "Écran introuvable dans la configuration active.";
+            }
+            Point shift = target.IsPrimary ? location : Point.Empty;
+            cfg.ShiftSources(shift);
+
+            const uint baseFlags = Native.SdcUseSuppliedConfig | Native.SdcVirtualModeAware
+                | Native.SdcAllowChanges;
+
+            uint hr = cfg.Apply(baseFlags | Native.SdcValidate);
+            if (hr != Native.ErrorSuccess)
+            {
+                return "Validation refusée : " + DisplayConfigData.DescribeError(hr);
+            }
+            if (!apply)
+            {
+                return null;
+            }
+            hr = cfg.Apply(baseFlags | Native.SdcApply | Native.SdcSaveToDatabase);
+            if (hr != Native.ErrorSuccess)
+            {
+                return "Application refusée : " + DisplayConfigData.DescribeError(hr);
+            }
+
+            // Le snapshot est indexé par position : il suit le même déplacement.
+            if (this._baseline != null)
+            {
+                MoveSource(this._baseline, from, location);
+                this._baseline.ShiftSources(shift);
+            }
+            this.Refresh();
+            return null;
+        }
+
+        private static bool MoveSource(DisplayConfigData cfg, Point from, Point to)
+        {
+            bool found = false;
+            for (int m = 0; m < cfg.ModeCount; m++)
+            {
+                if (cfg.ModeInfoType(m) != Native.ModeTypeSource || cfg.SourcePosition(m) != from) continue;
+                cfg.SetSourcePosition(m, to);
+                found = true;
+            }
+            return found;
+        }
+
+        // Rallume un écran éteint absent du snapshot : un chemin libre vers sa sortie est ajouté à
+        // la configuration active, Windows lui choisit mode et position (SDC_ALLOW_CHANGES).
+        private string EnableDetached(Screen target, bool apply)
+        {
+            DisplayConfigData active = DisplayConfigData.Query(Native.QdcOnlyActivePaths | Native.QdcVirtualModeAware);
+            DisplayConfigData all = DisplayConfigData.Query(Native.QdcAllPaths | Native.QdcVirtualModeAware);
+            int path;
+            if (!FindDetachedPaths(all, TargetKeys(active), SourceKeys(active)).TryGetValue(target.DetachedTarget, out path))
+            {
+                return "Cet écran n'est plus disponible (débranché ou sans source libre).";
+            }
+            DisplayConfigData cfg = active.WithActivatedPath(all, path);
+
+            const uint baseFlags = Native.SdcUseSuppliedConfig | Native.SdcVirtualModeAware
+                | Native.SdcAllowChanges;
+
+            uint hr = cfg.Apply(baseFlags | Native.SdcValidate);
+            if (hr != Native.ErrorSuccess)
+            {
+                return "Validation refusée : " + DisplayConfigData.DescribeError(hr);
+            }
+            if (!apply)
+            {
+                return null;
+            }
+
+            hr = cfg.Apply(baseFlags | Native.SdcApply | Native.SdcSaveToDatabase);
+            if (hr != Native.ErrorSuccess)
+            {
+                return "Application refusée : " + DisplayConfigData.DescribeError(hr);
+            }
+
+            this.Refresh();
+            return null;
+        }
+
+        // Pour chaque sortie disponible hors de `knownTargets`, un chemin inactif dont la source
+        // n'est pas déjà utilisée (clé de sortie -> index du chemin dans `all`).
+        private static Dictionary<string, int> FindDetachedPaths(DisplayConfigData all,
+            HashSet<string> knownTargets, HashSet<string> usedSources)
+        {
+            Dictionary<string, int> result = new Dictionary<string, int>();
+            for (int i = 0; i < all.PathCount; i++)
+            {
+                if (all.PathIsActive(i) || !all.PathTargetAvailable(i)) continue;
+                string target = all.PathTargetKey(i);
+                if (knownTargets.Contains(target) || result.ContainsKey(target)) continue;
+                if (usedSources.Contains(all.PathSourceKey(i))) continue;
+                result[target] = i;
+            }
+            return result;
+        }
+
+        private static HashSet<string> TargetKeys(DisplayConfigData cfg)
+        {
+            HashSet<string> keys = new HashSet<string>();
+            if (cfg == null) return keys;
+            for (int i = 0; i < cfg.PathCount; i++)
+            {
+                if (cfg.PathIsActive(i)) keys.Add(cfg.PathTargetKey(i));
+            }
+            return keys;
+        }
+
+        private static HashSet<string> SourceKeys(DisplayConfigData cfg)
+        {
+            HashSet<string> keys = new HashSet<string>();
+            for (int i = 0; i < cfg.PathCount; i++)
+            {
+                if (cfg.PathIsActive(i)) keys.Add(cfg.PathSourceKey(i));
+            }
+            return keys;
         }
 
         // `apply=false` : validation seule (SDC_VALIDATE), aucune modification de la configuration.

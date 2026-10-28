@@ -71,6 +71,37 @@ namespace TrayDisplays
                 }
             }
 
+            Line("--- validation : réactiver chaque écran coupé (SDC_VALIDATE seul) ---");
+            foreach (Screen s in state.Screens)
+            {
+                if (s.Enabled) continue;
+                string err = state.ValidateToggle(s);
+                if (err != null)
+                {
+                    Fail(string.Format("réactiver {0} : {1}", s.Title, err));
+                }
+                else
+                {
+                    Line(string.Format("  réactiver {0} : OK", s.Title));
+                }
+            }
+
+            Line("--- validation : déplacer chaque écran au-dessus des autres (SDC_VALIDATE seul) ---");
+            foreach (Screen s in state.Screens)
+            {
+                if (!s.Enabled || state.EnabledCount < 2) continue;
+                Point to = state.SnapPosition(s, new Point(s.Bounds.X, state.DesktopBounds.Top - s.Bounds.Height), 0);
+                string err = to == s.Bounds.Location ? "aucune position libre" : state.ValidateMove(s, to);
+                if (err != null)
+                {
+                    Fail(string.Format("déplacer {0} : {1}", s.Title, err));
+                }
+                else
+                {
+                    Line(string.Format("  déplacer {0} vers {1} : OK", s.Title, to));
+                }
+            }
+
             Line("--- validation : écran principal sur chaque écran (CDS_TEST seul) ---");
             foreach (Screen s in state.Screens)
             {

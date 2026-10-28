@@ -58,6 +58,21 @@ namespace TrayDisplays
             return ReadInt(this._paths, i * Native.PathSize + Native.PathTgt + Native.TgtId);
         }
 
+        // Identifiants stables d'une sortie (target) / d'une source : LUID de l'adaptateur + id.
+        public string PathTargetKey(int i)
+        {
+            int tgt = i * Native.PathSize + Native.PathTgt;
+            return string.Format("{0:x8}{1:x8}/{2}", ReadU32(this._paths, tgt + Native.TgtAdapterId + 4),
+                ReadU32(this._paths, tgt + Native.TgtAdapterId), ReadU32(this._paths, tgt + Native.TgtId));
+        }
+
+        public string PathSourceKey(int i)
+        {
+            int src = i * Native.PathSize + Native.PathSrc;
+            return string.Format("{0:x8}{1:x8}/{2}", ReadU32(this._paths, src + Native.SrcAdapterId + 4),
+                ReadU32(this._paths, src + Native.SrcAdapterId), ReadU32(this._paths, src + Native.SrcId));
+        }
+
         // high 16 bits de src.modeInfoIdx -> index du mode source
         public int SourceModeIndex(int i)
         {
@@ -182,6 +197,34 @@ namespace TrayDisplays
         {
             WriteU32(this._modes, m * Native.ModeSize + Native.SmPosX, (uint)p.X);
             WriteU32(this._modes, m * Native.ModeSize + Native.SmPosY, (uint)p.Y);
+        }
+
+        // Copie de la configuration avec, en plus, le chemin `path` de `from` activé sans mode
+        // (index invalides) : avec SDC_ALLOW_CHANGES, Windows lui choisit mode et position.
+        // En mode « virtual mode aware », le chemin doit avoir son propre groupe de clonage
+        // (low16 de src.modeInfoIdx), sinon SetDisplayConfig renvoie ERROR_INVALID_PARAMETER.
+        public DisplayConfigData WithActivatedPath(DisplayConfigData from, int path)
+        {
+            int cloneGroup = 0;
+            for (int i = 0; i < this.PathCount; i++)
+            {
+                uint group = ReadU32(this._paths, i * Native.PathSize + Native.PathSrc + Native.SrcModeInfoIdx) & 0xFFFF;
+                if (group != Native.InvalidModeIndex && group >= cloneGroup)
+                {
+                    cloneGroup = (int)group + 1;
+                }
+            }
+
+            byte[] paths = new byte[(this.PathCount + 1) * Native.PathSize];
+            Buffer.BlockCopy(this._paths, 0, paths, 0, this.PathCount * Native.PathSize);
+            Buffer.BlockCopy(from._paths, path * Native.PathSize, paths, this.PathCount * Native.PathSize, Native.PathSize);
+
+            DisplayConfigData cfg = new DisplayConfigData(paths, (byte[])this._modes.Clone(), this.PathCount + 1, this.ModeCount);
+            int added = this.PathCount * Native.PathSize;
+            WriteU32(paths, added + Native.PathSrc + Native.SrcModeInfoIdx, 0xFFFF0000 | (uint)cloneGroup);
+            WriteU32(paths, added + Native.PathTgt + Native.TgtModeInfoIdx, 0xFFFFFFFF);
+            cfg.SetPathFlags(this.PathCount, cfg.PathFlags(this.PathCount) | Native.PathActive);
+            return cfg;
         }
 
         // Déplace toutes les sources de -origin : l'écran qui était en `origin` passe en (0,0).

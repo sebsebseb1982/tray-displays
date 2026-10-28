@@ -8,8 +8,8 @@ using System.Windows.Forms;
 namespace TrayDisplays
 {
     // Panneau sans bordure affiché près de la barre des tâches : dessine le layout des écrans
-    // (comme les Paramètres d'affichage) et permet de couper/réactiver un écran (clic) ou de
-    // définir l'écran principal (clic droit).
+    // (comme les Paramètres d'affichage) et permet de les réorganiser (glisser), de couper/réactiver
+    // un écran (double-clic) ou de définir l'écran principal (clic droit).
     internal sealed class PopupForm : Form
     {
         private static readonly Color Background = Color.FromArgb(32, 36, 44);
@@ -34,6 +34,7 @@ namespace TrayDisplays
         private readonly Font _boldFont;
 
         private Rectangle _screenArea;
+        private Rectangle _areaBox;                // place réservée aux écrans, fixe pendant un glisser
         private Rectangle _desktop;
         private Rectangle _statusRect;
         private float _scale;
@@ -42,6 +43,14 @@ namespace TrayDisplays
         private DateTime _statusUntil = DateTime.MinValue;
         private HitZone _hover = null;
         private int _lastHideTick = 0;
+
+        // Glisser d'un écran : zone pressée, point de départ, échelle au départ et position
+        // (aimantée, en coordonnées du bureau) où l'écran serait déposé.
+        private HitZone _pressed = null;
+        private Point _pressPoint;
+        private float _pressScale;
+        private bool _dragging = false;
+        private Point _dropLocation;
 
         public PopupForm(DisplayState state)
         {
@@ -85,6 +94,10 @@ namespace TrayDisplays
 
         public void UpdateLayout()
         {
+            if (_pressed != null)
+            {
+                return; // pas de relecture pendant un glisser : la disposition est reconstruite au dépôt
+            }
             RebuildLayout();
             this.Invalidate();
         }
@@ -120,6 +133,7 @@ namespace TrayDisplays
         protected override void OnDeactivate(EventArgs e)
         {
             base.OnDeactivate(e);
+            CancelDrag();
             _lastHideTick = Environment.TickCount;
             this.Hide();
         }
@@ -172,6 +186,7 @@ namespace TrayDisplays
             }
 
             _screenArea = new Rectangle((width - areaWidth) / 2, headerHeight, areaWidth, areaHeight);
+            _areaBox = _screenArea;
             _statusRect = new Rectangle(pad, buttonTop + buttonHeight + S(10), width - 2 * pad, statusHeight);
 
             BuildRoundedRegion(width, height);
@@ -325,37 +340,46 @@ namespace TrayDisplays
             }
         }
 
+        // Les rectangles sont recalculés à partir des bornes : pendant un glisser, la vue est recadrée
+        // (UpdateDragView) et l'écran déplacé est dessiné en dernier, à sa position de dépôt.
         private void DrawScreens(Graphics g)
         {
             foreach (HitZone zone in _zones)
             {
-                if (zone.Kind != HitKind.Screen) continue;
-                Screen s = zone.Screen;
-                Rectangle r = zone.Rect;
-                bool hovered = _hover == zone;
-                bool primary = s.IsPrimary && s.Enabled;
-
-                Color fill = s.Enabled ? (hovered ? ScreenHover : ScreenFill) : (hovered ? ScreenFill : OffFill);
-                Color outline = primary ? PrimaryAccent : (s.Enabled ? ScreenBorder : OffBorder);
-
-                using (GraphicsPath path = RoundedPath(new RectangleF(r.X + 0.5f, r.Y + 0.5f, r.Width - 1, r.Height - 1), S(4)))
-                {
-                    using (SolidBrush brush = new SolidBrush(fill))
-                    {
-                        g.FillPath(brush, path);
-                    }
-                    using (Pen pen = new Pen(outline, primary ? 2.0f : 1.0f))
-                    {
-                        if (!s.Enabled)
-                        {
-                            pen.DashStyle = DashStyle.Dash;
-                        }
-                        g.DrawPath(pen, path);
-                    }
-                }
-
-                DrawScreenLabel(g, r, s, primary);
+                if (zone.Kind != HitKind.Screen || (_dragging && zone == _pressed)) continue;
+                DrawScreen(g, zone.Screen, ScreenToClient(zone.Screen.Bounds), _hover == zone);
             }
+            if (_dragging)
+            {
+                Screen s = _pressed.Screen;
+                DrawScreen(g, s, ScreenToClient(new Rectangle(_dropLocation, s.Bounds.Size)), true);
+            }
+        }
+
+        private void DrawScreen(Graphics g, Screen s, Rectangle r, bool hovered)
+        {
+            bool primary = s.IsPrimary && s.Enabled;
+
+            Color fill = s.Enabled ? (hovered ? ScreenHover : ScreenFill) : (hovered ? ScreenFill : OffFill);
+            Color outline = primary ? PrimaryAccent : (s.Enabled ? ScreenBorder : OffBorder);
+
+            using (GraphicsPath path = RoundedPath(new RectangleF(r.X + 0.5f, r.Y + 0.5f, r.Width - 1, r.Height - 1), S(4)))
+            {
+                using (SolidBrush brush = new SolidBrush(fill))
+                {
+                    g.FillPath(brush, path);
+                }
+                using (Pen pen = new Pen(outline, primary ? 2.0f : 1.0f))
+                {
+                    if (!s.Enabled)
+                    {
+                        pen.DashStyle = DashStyle.Dash;
+                    }
+                    g.DrawPath(pen, path);
+                }
+            }
+
+            DrawScreenLabel(g, r, s, primary);
         }
 
         private void DrawScreenLabel(Graphics g, Rectangle r, Screen s, bool primary)
@@ -426,7 +450,7 @@ namespace TrayDisplays
         private void DrawStatus(Graphics g)
         {
             bool isStatus = !string.IsNullOrEmpty(_status) && _statusUntil > DateTime.Now;
-            string text = isStatus ? _status : "Clic : couper / réactiver · Clic droit : écran principal";
+            string text = isStatus ? _status : "Glisser : déplacer · Double-clic : couper / réactiver · Clic droit : écran principal";
             using (SolidBrush brush = new SolidBrush(isStatus ? TextClr : DimText))
             using (StringFormat f = new StringFormat(StringFormat.GenericTypographic))
             {
@@ -438,13 +462,91 @@ namespace TrayDisplays
         protected override void OnMouseMove(MouseEventArgs e)
         {
             base.OnMouseMove(e);
+            if (_pressed != null)
+            {
+                int dx = e.X - _pressPoint.X;
+                int dy = e.Y - _pressPoint.Y;
+                Size threshold = SystemInformation.DragSize;
+                if (!_dragging && (Math.Abs(dx) > threshold.Width / 2 || Math.Abs(dy) > threshold.Height / 2))
+                {
+                    _dragging = true;
+                }
+                if (_dragging)
+                {
+                    Screen s = _pressed.Screen;
+                    Point proposed = new Point(
+                        s.Bounds.X + (int)Math.Round(dx / _pressScale),
+                        s.Bounds.Y + (int)Math.Round(dy / _pressScale));
+                    _dropLocation = _state.SnapPosition(s, proposed, (int)Math.Round(S(10) / _pressScale));
+                    UpdateDragView();
+                    this.Invalidate();
+                }
+                return;
+            }
+
             HitZone zone = HitTest(e.Location);
             if (zone != _hover)
             {
                 _hover = zone;
-                this.Cursor = zone == null ? Cursors.Default : Cursors.Hand;
+                this.Cursor = zone == null ? Cursors.Default : (CanDrag(zone) ? Cursors.SizeAll : Cursors.Hand);
                 this.Invalidate();
             }
+        }
+
+        private bool CanDrag(HitZone zone)
+        {
+            return zone.Kind == HitKind.Screen && zone.Screen.Enabled && _state.EnabledCount > 1;
+        }
+
+        // Recadre la vue sur les écrans fixes + l'écran à sa position de dépôt, dans la même place
+        // que le panneau réserve aux écrans : l'écran déplacé reste visible même hors du bureau actuel.
+        private void UpdateDragView()
+        {
+            Rectangle view = new Rectangle(_dropLocation, _pressed.Screen.Bounds.Size);
+            foreach (HitZone zone in _zones)
+            {
+                if (zone.Kind != HitKind.Screen || zone == _pressed) continue;
+                view = Rectangle.Union(view, zone.Screen.Bounds);
+            }
+            _desktop = view;
+            _scale = Math.Min((float)_areaBox.Width / view.Width, (float)_areaBox.Height / view.Height);
+            int w = (int)Math.Round(view.Width * _scale);
+            int h = (int)Math.Round(view.Height * _scale);
+            _screenArea = new Rectangle(_areaBox.X + (_areaBox.Width - w) / 2, _areaBox.Y + (_areaBox.Height - h) / 2, w, h);
+        }
+
+        private void CancelDrag()
+        {
+            bool wasDragging = _dragging;
+            _pressed = null;
+            _dragging = false;
+            if (wasDragging)
+            {
+                RebuildLayout();
+                this.Invalidate();
+            }
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            base.OnMouseUp(e);
+            HitZone pressed = _pressed;
+            bool dragged = _dragging;
+            _pressed = null;
+            _dragging = false;
+            if (pressed == null || !dragged)
+            {
+                return;
+            }
+
+            if (_dropLocation != pressed.Screen.Bounds.Location)
+            {
+                string err = _state.MoveScreen(pressed.Screen, _dropLocation);
+                SetStatus(err ?? string.Format("{0} déplacé.", pressed.Screen.Title));
+            }
+            _hover = null;
+            RebuildLayout();
+            this.Invalidate();
         }
 
         protected override void OnMouseLeave(EventArgs e)
@@ -483,11 +585,28 @@ namespace TrayDisplays
                         err = _state.SetPrimary(zone.Screen);
                         SetStatus(err ?? string.Format("{0} est maintenant l'écran principal.", zone.Screen.Title));
                     }
-                    else
+                    else if (e.Button != MouseButtons.Left)
                     {
+                        return;
+                    }
+                    else if (e.Clicks >= 2)
+                    {
+                        CancelDrag();
                         bool wasEnabled = zone.Screen.Enabled;
                         err = _state.Toggle(zone.Screen);
                         SetStatus(err ?? string.Format("{0} {1}.", zone.Screen.Title, wasEnabled ? "coupé" : "réactivé"));
+                    }
+                    else
+                    {
+                        // Simple clic : début d'un éventuel glisser, rien n'est appliqué avant le dépôt.
+                        if (CanDrag(zone))
+                        {
+                            _pressed = zone;
+                            _pressPoint = e.Location;
+                            _pressScale = _scale;
+                            _dragging = false;
+                        }
+                        return;
                     }
                     break;
             }
@@ -502,6 +621,11 @@ namespace TrayDisplays
             base.OnKeyDown(e);
             if (e.KeyCode == Keys.Escape)
             {
+                if (_dragging)
+                {
+                    CancelDrag(); // Échap pendant un glisser : l'écran revient à sa place
+                    return;
+                }
                 this.Hide();
             }
         }
